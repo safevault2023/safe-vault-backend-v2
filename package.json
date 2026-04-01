@@ -1,0 +1,15 @@
+{
+  "name": "safe-vault-backend",
+  "version": "1.0.0",
+  "description": "Safe Vault Backend",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "ethers": "^6.0.0"
+  }
+}
